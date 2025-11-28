@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>DynamoDB Connection Test</title>
+    <style>
+        body { font-family: Arial, sans-serif; padding: 20px; }
+        .test { margin: 20px 0; padding: 15px; border: 1px solid #ddd; border-radius: 5px; }
+        .success { background-color: #d4edda; border-color: #c3e6cb; }
+        .error { background-color: #f8d7da; border-color: #f5c6cb; }
+        .info { background-color: #d1ecf1; border-color: #bee5eb; }
+        button { padding: 10px 20px; margin: 5px; cursor: pointer; }
+        pre { background: #f5f5f5; padding: 10px; overflow-x: auto; }
+    </style>
+</head>
+<body>
+    <h1>🔍 DynamoDB Connection Diagnostic Tool</h1>
+    
+    <div class="test info">
+        <h3>API Base URL</h3>
+        <input type="text" id="apiBase" value="https://sj2osq50u1.execute-api.us-east-1.amazonaws.com/demo" style="width: 100%; padding: 5px;">
+    </div>
+
+    <button onclick="testAll()">Run All Tests</button>
+    <button onclick="testPlants()">Test Plants API</button>
+    <button onclick="testHeatmap()">Test Heatmap API</button>
+    <button onclick="clearResults()">Clear Results</button>
+
+    <div id="results"></div>
+
+    <script>
+        const API_BASE = () => document.getElementById('apiBase').value;
+
+        async function testPlants() {
+            const resultDiv = document.getElementById('results');
+            resultDiv.innerHTML = '<div class="test info">Testing Plants API...</div>' + resultDiv.innerHTML;
+            
+            try {
+                const url = `${API_BASE()}/plants`;
+                console.log('Testing:', url);
+                
+                const res = await fetch(url);
+                const text = await res.text();
+                let data;
+                
+                try {
+                    data = JSON.parse(text);
+                } catch (e) {
+                    resultDiv.innerHTML = `
+                        <div class="test error">
+                            <h3>❌ Plants API - Parse Error</h3>
+                            <p><strong>Status:</strong> ${res.status} ${res.statusText}</p>
+                            <p><strong>Response:</strong></p>
+                            <pre>${text.substring(0, 500)}</pre>
+                        </div>
+                    ` + resultDiv.innerHTML;
+                    return;
+                }
+
+                if (res.ok && !data.error) {
+                    const itemCount = data.items?.length || 0;
+                    resultDiv.innerHTML = `
+                        <div class="test success">
+                            <h3>✅ Plants API - Success</h3>
+                            <p><strong>Status:</strong> ${res.status}</p>
+                            <p><strong>Items Found:</strong> ${itemCount}</p>
+                            <p><strong>Total:</strong> ${data.total || 0}</p>
+                            <details>
+                                <summary>View Response</summary>
+                                <pre>${JSON.stringify(data, null, 2)}</pre>
+                            </details>
+                        </div>
+                    ` + resultDiv.innerHTML;
+                } else {
+                    resultDiv.innerHTML = `
+                        <div class="test error">
+                            <h3>❌ Plants API - Error</h3>
+                            <p><strong>Status:</strong> ${res.status} ${res.statusText}</p>
+                            <p><strong>Error:</strong> ${data.error || 'Unknown error'}</p>
+                            <details>
+                                <summary>View Response</summary>
+                                <pre>${JSON.stringify(data, null, 2)}</pre>
+                            </details>
+                        </div>
+                    ` + resultDiv.innerHTML;
+                }
+            } catch (err) {
+                resultDiv.innerHTML = `
+                    <div class="test error">
+                        <h3>❌ Plants API - Network Error</h3>
+                        <p><strong>Error:</strong> ${err.message}</p>
+                        <p>Check:</p>
+                        <ul>
+                            <li>API Gateway URL is correct</li>
+                            <li>CORS is enabled</li>
+                            <li>Network connection is working</li>
+                        </ul>
+                    </div>
+                ` + resultDiv.innerHTML;
+            }
+        }
+
+        async function testHeatmap() {
+            const resultDiv = document.getElementById('results');
+            resultDiv.innerHTML = '<div class="test info">Testing Heatmap API...</div>' + resultDiv.innerHTML;
+            
+            try {
+                const url = `${API_BASE()}/heatmap`;
+                console.log('Testing:', url);
+                
+                const res = await fetch(url);
+                const text = await res.text();
+                let data;
+                
+                try {
+                    data = JSON.parse(text);
+                } catch (e) {
+                    resultDiv.innerHTML = `
+                        <div class="test error">
+                            <h3>❌ Heatmap API - Parse Error</h3>
+                            <p><strong>Status:</strong> ${res.status} ${res.statusText}</p>
+                            <p><strong>Response:</strong></p>
+                            <pre>${text.substring(0, 500)}</pre>
+                        </div>
+                    ` + resultDiv.innerHTML;
+                    return;
+                }
+
+                if (res.ok && !data.error) {
+                    const featureCount = data.geojson?.features?.length || 0;
+                    resultDiv.innerHTML = `
+                        <div class="test success">
+                            <h3>✅ Heatmap API - Success</h3>
+                            <p><strong>Status:</strong> ${res.status}</p>
+                            <p><strong>Features Found:</strong> ${featureCount}</p>
+                            <p><strong>Count:</strong> ${data.count || 0}</p>
+                            <details>
+                                <summary>View Response</summary>
+                                <pre>${JSON.stringify(data, null, 2)}</pre>
+                            </details>
+                        </div>
+                    ` + resultDiv.innerHTML;
+                } else {
+                    resultDiv.innerHTML = `
+                        <div class="test error">
+                            <h3>❌ Heatmap API - Error</h3>
+                            <p><strong>Status:</strong> ${res.status} ${res.statusText}</p>
+                            <p><strong>Error:</strong> ${data.error || 'Unknown error'}</p>
+                            <details>
+                                <summary>View Response</summary>
+                                <pre>${JSON.stringify(data, null, 2)}</pre>
+                            </details>
+                        </div>
+                    ` + resultDiv.innerHTML;
+                }
+            } catch (err) {
+                resultDiv.innerHTML = `
+                    <div class="test error">
+                        <h3>❌ Heatmap API - Network Error</h3>
+                        <p><strong>Error:</strong> ${err.message}</p>
+                    </div>
+                ` + resultDiv.innerHTML;
+            }
+        }
+
+        async function testAll() {
+            document.getElementById('results').innerHTML = '';
+            await testPlants();
+            await new Promise(r => setTimeout(r, 500));
+            await testHeatmap();
+        }
+
+        function clearResults() {
+            document.getElementById('results').innerHTML = '';
+        }
+    </script>
+</body>
+</html>
+

@@ -1,0 +1,1240 @@
+// app/users.tsx
+import React, { useEffect, useState } from "react";
+import {
+  ActivityIndicator,
+  Alert,
+  Image,
+  Platform,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Switch,
+  Text,
+  TextInput,
+  View
+} from "react-native";
+import AdminShell from "../components/AdminShell";
+import COLORS from "../src/theme/colors";
+import S3Image from "../components/S3Image";
+
+// Users API Gateway URL
+const USERS_API_BASE = "https://sj2osq50u1.execute-api.us-east-1.amazonaws.com/demo";
+
+// IoT API Gateway URL (for reference, not used here)
+const IOT_API_BASE = "https://ofqrsoejih.execute-api.us-east-1.amazonaws.com/prod";
+
+const ROOT_BASE = USERS_API_BASE; // For profile pics, adjust if needed
+
+// Get Cognito token for authenticated requests
+import { getAccessToken } from "../authStore";
+
+// ---------------- API helper ----------------
+async function api(path: string, options: RequestInit = {}) {
+  // Map old PHP endpoints to new Lambda routes
+  let lambdaPath = path;
+  let queryString = "";
+
+  // Parse query parameters manually
+  const queryIndex = path.indexOf("?");
+  if (queryIndex !== -1) {
+    queryString = path.substring(queryIndex);
+    path = path.substring(0, queryIndex);
+  }
+
+  const queryParams = new URLSearchParams(queryString);
+  const mode = queryParams.get("mode");
+  const userId = queryParams.get("id");
+  const email = queryParams.get("email");
+  const page = queryParams.get("page");
+  const pageSize = queryParams.get("page_size");
+  const name = queryParams.get("name");
+  const isAdmin = queryParams.get("is_admin");
+
+  // Determine the Lambda route based on path and method
+  if (path.includes("auth/register") && options.method === "POST") {
+    // Register new user (creates Cognito + DynamoDB)
+    lambdaPath = "/auth/register";
+  } else if (path.includes("users.php")) {
+    if (options.method === "POST" && !userId) {
+      // Create user (admin only, DynamoDB only - not used for new registrations)
+      lambdaPath = "/users/create";
+    } else if (options.method === "PUT" && userId) {
+      // Update user
+      lambdaPath = `/users/${String(userId)}`;
+    } else if (options.method === "DELETE" && userId) {
+      // Delete user
+      lambdaPath = `/users/${String(userId)}`;
+    } else if (options.method === "GET" && userId) {
+      // Get user by ID
+      lambdaPath = `/users/${String(userId)}`;
+    } else if (options.method === "GET" && email) {
+      // Get user by email
+      lambdaPath = `/users/getByEmail?email=${encodeURIComponent(email)}`;
+    } else if (options.method === "GET" && mode === "list") {
+      // List users endpoint
+      lambdaPath = "/users/list";
+    } else if (options.method === "GET" && mode === "stats") {
+      // Stats endpoint
+      lambdaPath = "/users/stats";
+    } else if (options.method === "GET" && !mode && !userId && !email) {
+      // Default: list all users
+      lambdaPath = "/users/list";
+    }
+  } else if (path.includes("uploads.php")) {
+    // Uploads - might still be on old backend or need separate Lambda
+    throw new Error("Uploads endpoint not yet migrated to AWS. Please use localhost backend for uploads.");
+  }
+
+  let url = lambdaPath.startsWith("http")
+    ? lambdaPath
+    : `${USERS_API_BASE}${lambdaPath.startsWith("/") ? lambdaPath : `/${lambdaPath}`}`;
+
+  // Add remaining query parameters if any
+  if (queryString && !lambdaPath.includes("?")) {
+    const separator = url.includes("?") ? "&" : "?";
+    url = `${url}${separator}${queryString.substring(1)}`;
+  }
+
+  const token = getAccessToken();
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    ...(options.headers as Record<string, string> || {}),
+  };
+
+  // Add Authorization header if token exists
+  if (token) {
+    headers["Authorization"] = `Bearer ${token}`;
+  }
+
+  console.log("Users API:", options.method || "GET", url);
+
+  try {
+    const res = await fetch(url, { ...options, headers });
+    const text = await res.text();
+
+    console.log("Users API Response:", res.status, text.substring(0, 200));
+
+    let data: any = {};
+    try {
+      data = text ? JSON.parse(text) : {};
+    } catch (e) {
+      console.error("JSON Parse Error:", text);
+      throw new Error("Invalid JSON: " + text.substring(0, 100));
+    }
+
+    if (!res.ok) {
+      throw new Error(data.error || data.message || `HTTP ${res.status}: ${text.substring(0, 100)}`);
+    }
+
+    if (data.error) {
+      throw new Error(data.error);
+    }
+
+    return data;
+  } catch (e: any) {
+    console.error("Users API Error:", e);
+    throw e;
+  }
+}
+
+// --------------- Types ----------------
+type UserItem = {
+  id: number;
+  username: string;
+  email: string;
+  real_name: string;
+  phone_number: string | null;
+  profile_pic: string | null;
+  email_visible: number | boolean;
+  is_admin: number | boolean;
+  created_at: string;
+};
+
+type Tab = "find" | "all" | "add" | "edit";
+
+// --------------- Screen ----------------
+export default function UsersScreen() {
+  const [tab, setTab] = useState<Tab>("find");
+
+  // filters
+  const [filterName, setFilterName] = useState("");
+  const [filterEmail, setFilterEmail] = useState("");
+  const [filterAdmin, setFilterAdmin] = useState<"" | "1" | "0">("");
+
+  // list
+  const [items, setItems] = useState<UserItem[]>([]);
+  const [total, setTotal] = useState(0);
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(10);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string>("");
+
+  // add form
+  const [addForm, setAddForm] = useState({
+    real_name: "",
+    username: "",
+    email: "",
+    phone_number: "",
+    password: "",
+    password2: "",
+    email_visible: false,
+    is_admin: false,
+  });
+  const [addError, setAddError] = useState("");
+
+  // edit form
+  const [editForm, setEditForm] = useState({
+    id: 0,
+    real_name: "",
+    username: "",
+    email: "",
+    phone_number: "",
+    email_visible: false,
+    is_admin: false,
+  });
+  const [editIdInput, setEditIdInput] = useState("");
+  const [editError, setEditError] = useState("");
+
+  // ---------------- Helpers ----------------
+  useEffect(() => {
+    loadFind(1);
+  }, []);
+
+  const formatDate = (s: string) => {
+    if (!s) return "-";
+    const d = new Date(s);
+    if (isNaN(d.getTime())) return s;
+    const dd = String(d.getDate()).padStart(2, "0");
+    const mm = String(d.getMonth() + 1).padStart(2, "0");
+    const yyyy = d.getFullYear();
+    return `${dd}.${mm}.${yyyy}`;
+  };
+
+  const loadFind = async (p: number) => {
+    try {
+      setLoading(true);
+      setError("");
+      setTab("find");
+      setPage(p);
+
+      const params = new URLSearchParams();
+      params.set("mode", "list");
+      params.set("page", String(p));
+      params.set("page_size", String(pageSize));
+      if (filterName) params.set("name", filterName);
+      if (filterEmail) params.set("email", filterEmail);
+      if (filterAdmin !== "") params.set("is_admin", filterAdmin);
+
+      const res = await api("users.php?" + params.toString());
+
+      // Handle response - might be empty if endpoint not implemented
+      if (res.items && Array.isArray(res.items)) {
+        // Map DynamoDB format to expected format
+        const mappedItems = res.items.map((item: any) => ({
+          id: parseInt(item.id || item.userID || '0'),
+          userID: item.userID || item.id,
+          username: item.username || '',
+          email: item.email || '',
+          real_name: item.real_name || item.name || item.realName || '',
+          phone_number: item.phone_number || item.phone || null,
+          profile_pic: item.profile_pic || null,
+          email_visible: item.email_visible || false,
+          is_admin: item.is_admin === true ||
+            item.is_admin === 1 ||
+            item.is_admin === "1",
+          created_at: item.created_at || item.createdAt || '',
+        }));
+        setItems(mappedItems);
+        setTotal(res.total || mappedItems.length);
+      } else {
+        setItems([]);
+        setTotal(0);
+        if (!res.items) {
+          setError("List endpoint not yet implemented. Please add /users/list to Lambda.");
+        }
+      }
+    } catch (e: any) {
+      setError(e.message || "Failed to load users");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const loadAll = async (p: number) => {
+    try {
+      setLoading(true);
+      setError("");
+      setTab("all");
+      setPage(p);
+
+      const params = new URLSearchParams();
+      params.set("page", String(p));
+      params.set("page_size", String(pageSize));
+
+      const res = await api("users.php?" + params.toString());
+
+      // Handle response - might be empty if endpoint not implemented
+      if (res.items && Array.isArray(res.items)) {
+        // Map DynamoDB format to expected format
+        const mappedItems = res.items.map((item: any) => ({
+          id: parseInt(item.id || item.userID || '0'),
+          userID: item.userID || item.id,
+          username: item.username || '',
+          email: item.email || '',
+          real_name: item.real_name || item.name || item.realName || '',
+          phone_number: item.phone_number || item.phone || null,
+          profile_pic: item.profile_pic || null,
+          email_visible: item.email_visible || false,
+          is_admin: item.is_admin || false,
+          created_at: item.created_at || item.createdAt || '',
+        }));
+        setItems(mappedItems);
+        setTotal(res.total || mappedItems.length);
+      } else {
+        setItems([]);
+        setTotal(0);
+        if (!res.items) {
+          setError("List endpoint not yet implemented. Please add /users/list to Lambda.");
+        }
+      }
+    } catch (e: any) {
+      setError(e.message || "Failed to load users");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const clearFilter = () => {
+    setFilterName("");
+    setFilterEmail("");
+    setFilterAdmin("");
+    loadFind(1);
+  };
+
+  const selectRow = (u: UserItem) => {
+    setEditForm({
+      id: u.id,
+      real_name: u.real_name,
+      username: u.username,
+      email: u.email,
+      phone_number: u.phone_number || "",
+      email_visible: !!u.email_visible,
+      is_admin: !!u.is_admin,
+    });
+    setEditIdInput(String(u.id));
+    setTab("edit");
+  };
+
+  const loadForEdit = async () => {
+    if (!editIdInput) return;
+    try {
+      setEditError("");
+      const res = await api(
+        `users.php?id=${encodeURIComponent(editIdInput)}`
+      );
+
+      // Handle DynamoDB response format (user object might be nested or in DynamoDB format)
+      const user = res.user || res;
+
+      // Handle DynamoDB format (with .S, .N, etc.)
+      const getUserValue = (field: string) => {
+        const val = user[field];
+        if (!val) return null;
+        if (typeof val === 'object' && val.S) return val.S; // DynamoDB string
+        if (typeof val === 'object' && val.N) return val.N; // DynamoDB number
+        return val; // Already extracted
+      };
+
+      setEditForm({
+        id: parseInt(getUserValue('userID') || getUserValue('id') || user.userID || user.id || editIdInput),
+        real_name: getUserValue('name') || getUserValue('realName') || user.real_name || user.name || user.realName || "",
+        username: getUserValue('username') || user.username || "",
+        email: getUserValue('email') || user.email || "",
+        phone_number: getUserValue('phone') || user.phone_number || user.phone || "",
+        email_visible: !!user.email_visible,
+        is_admin: !!user.is_admin,
+      });
+      setTab("edit");
+    } catch (e: any) {
+      setEditError(e.message || "Failed to load user");
+    }
+  };
+
+  const createUser = async () => {
+    setAddError("");
+    const f = addForm;
+
+    if (!f.real_name || !f.username || !f.email || !f.password) {
+      setAddError("Please fill all required fields.");
+      return;
+    }
+    if (f.password !== f.password2) {
+      setAddError("Passwords do not match.");
+      return;
+    }
+    if (!f.phone_number) {
+      setAddError("Phone number is required.");
+      return;
+    }
+
+    try {
+      // Use Cognito register endpoint to create user with password
+      // This creates both Cognito user and DynamoDB record
+      const body = {
+        email: f.email,
+        password: f.password,
+        username: f.username,
+        name: f.real_name,
+        phone: f.phone_number,
+        is_admin: f.is_admin ? 1 : 0,
+      };
+
+      const res = await api("auth/register", {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+
+      Alert.alert("Success", "User created. User needs to confirm their email.");
+      setAddForm({
+        real_name: "",
+        username: "",
+        email: "",
+        phone_number: "",
+        password: "",
+        password2: "",
+        email_visible: false,
+        is_admin: false,
+      });
+      loadAll(1);
+      setTab("all");
+    } catch (e: any) {
+      setAddError(e.message || "Failed to create user");
+    }
+  };
+
+  const saveEdit = async () => {
+    setEditError("");
+    const f = editForm;
+    if (!f.id) {
+      setEditError("No user selected.");
+      return;
+    }
+    try {
+      // Map to Lambda format: name, username, email, phone, is_admin
+      const body = {
+        name: f.real_name,
+        username: f.username,
+        email: f.email,
+        phone: f.phone_number || "",
+        is_admin: f.is_admin ? 1 : 0
+      };
+      await api(`users.php?id=${f.id}`, {
+        method: "PUT",
+        body: JSON.stringify(body),
+      });
+      Alert.alert("Success", "User updated");
+      loadAll(page);
+    } catch (e: any) {
+      setEditError(e.message || "Failed to update user");
+    }
+  };
+
+  const deleteUser = async () => {
+    const f = editForm;
+
+    if (!f.id) {
+      // Helpful feedback if user hasn't selected anything
+      if (Platform.OS === "web") {
+        window.alert("No user selected. Please select a row in Find/All or load an ID first.");
+      } else {
+        Alert.alert("No user selected", "Please select a row in Find/All or load an ID first.");
+      }
+      return;
+    }
+
+    const doDelete = async () => {
+      try {
+        await api(`users.php?id=${f.id}`, { method: "DELETE" });
+
+        if (Platform.OS === "web") {
+          window.alert("User deleted");
+        } else {
+          Alert.alert("Deleted", "User deleted");
+        }
+
+        // reset form + reload list
+        setEditForm({
+          id: 0,
+          real_name: "",
+          username: "",
+          email: "",
+          phone_number: "",
+          email_visible: false,
+          is_admin: false,
+        });
+        loadAll(1);
+        setTab("all");
+      } catch (e: any) {
+        const msg = e.message || "Failed to delete user";
+        if (Platform.OS === "web") {
+          window.alert(msg);
+        } else {
+          Alert.alert("Error", msg);
+        }
+      }
+    };
+
+    if (Platform.OS === "web") {
+      // Browser-style confirm dialog
+      const ok = window.confirm("Delete this user?");
+      if (ok) {
+        await doDelete();
+      }
+    } else {
+      // Native Alert with two buttons
+      Alert.alert(
+        "Confirm",
+        "Delete this user?",
+        [
+          { text: "Cancel", style: "cancel" },
+          { text: "Delete", style: "destructive", onPress: doDelete },
+        ],
+        { cancelable: true }
+      );
+    }
+  };
+
+  const totalPages = Math.max(1, Math.ceil((total || 0) / pageSize));
+
+  const goPage = (p: number) => {
+    if (p < 1 || p > totalPages) return;
+    if (tab === "all") {
+      loadAll(p);
+    } else {
+      loadFind(p);
+    }
+  };
+
+  // --------------- Render ----------------
+  return (
+    <AdminShell
+      title="Users"
+      subtitle="Find, list, add, and edit accounts"
+    >
+      <ScrollView
+        style={{ flex: 1 }}
+        contentContainerStyle={{ paddingBottom: 24 }}
+      >
+        {/* Tabs */}
+        <View style={styles.tabRow}>
+          <TabButton
+            label="Find user"
+            active={tab === "find"}
+            onPress={() => loadFind(1)}
+          />
+          <TabButton
+            label="All account"
+            active={tab === "all"}
+            onPress={() => loadAll(1)}
+          />
+          <TabButton
+            label="Add accounts"
+            active={tab === "add"}
+            onPress={() => setTab("add")}
+          />
+          <TabButton
+            label="Edit accounts"
+            active={tab === "edit"}
+            onPress={() => setTab("edit")}
+          />
+        </View>
+
+        {/* Filter / Find */}
+        {tab === "find" && (
+          <View style={styles.card}>
+            <Text style={styles.cardTitle}>Filter</Text>
+
+            <View style={styles.filterRow}>
+              <View style={{ flex: 1, marginRight: 12 }}>
+                <Text style={styles.label}>Name</Text>
+                <TextInput
+                  value={filterName}
+                  onChangeText={setFilterName}
+                  placeholder="Enter real name or username"
+                  style={styles.inputLg}
+                />
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.label}>Email address</Text>
+                <TextInput
+                  value={filterEmail}
+                  onChangeText={setFilterEmail}
+                  placeholder="example@mail.com"
+                  style={styles.inputLg}
+                />
+              </View>
+            </View>
+
+            <View style={{ marginTop: 12, maxWidth: 320 }}>
+              <Text style={styles.label}>Admin</Text>
+              <View style={styles.selectFake}>
+                <TextInput
+                  editable={false}
+                  value={
+                    filterAdmin === ""
+                      ? "Any"
+                      : filterAdmin === "1"
+                        ? "Yes"
+                        : "No"
+                  }
+                  style={{ flex: 1 }}
+                />
+              </View>
+
+              <View style={{ flexDirection: "row", marginTop: 4 }}>
+                <Pressable
+                  style={[styles.chip, { marginRight: 8 }]}
+                  onPress={() => setFilterAdmin("")}
+                >
+                  <Text>Any</Text>
+                </Pressable>
+                <Pressable
+                  style={[styles.chip, { marginRight: 8 }]}
+                  onPress={() => setFilterAdmin("1")}
+                >
+                  <Text>Yes</Text>
+                </Pressable>
+                <Pressable
+                  style={styles.chip}
+                  onPress={() => setFilterAdmin("0")}
+                >
+                  <Text>No</Text>
+                </Pressable>
+              </View>
+            </View>
+
+            <View style={styles.actionRow}>
+              <Pressable style={styles.btn} onPress={clearFilter}>
+                <Text>Clear</Text>
+              </Pressable>
+              <Pressable
+                style={[styles.btn, styles.btnPrimary]}
+                onPress={() => loadFind(1)}
+              >
+                <Text style={{ color: COLORS.white }}>Search</Text>
+              </Pressable>
+            </View>
+          </View>
+        )}
+
+        {/* Results table (Find & All) */}
+        {(tab === "find" || tab === "all") && (
+          <View style={styles.card}>
+            <View
+              style={{
+                flexDirection: "row",
+                justifyContent: "space-between",
+                marginBottom: 8,
+              }}
+            >
+              <Text style={{ fontSize: 16 }}>
+                <Text style={{ fontWeight: "600" }}>Found:</Text>{" "}
+                {total || 0}
+              </Text>
+            </View>
+
+            {error ? (
+              <Text style={{ color: COLORS.error }}>{error}</Text>
+            ) : null}
+
+            {loading && (
+              <View style={{ paddingVertical: 8 }}>
+                <ActivityIndicator />
+              </View>
+            )}
+
+            <ScrollView horizontal>
+              <View style={{ minWidth: 1200 }}>
+                <View style={styles.tableHeader}>
+                  <Text style={[styles.th, { flex: 2 }]}>Real Name</Text>
+                  <Text style={[styles.th, { flex: 1.5 }]}>Username</Text>
+                  <Text style={[styles.th, { flex: 2.3 }]}>Email</Text>
+                  <Text style={[styles.th, { flex: 1.8 }]}>Profile Pic</Text>
+                  <Text style={[styles.th, { flex: 1.8 }]}>
+                    Phone Number
+                  </Text>
+                  <Text style={[styles.th, { flex: 1.2 }]}>
+                    Email Visible
+                  </Text>
+                  <Text style={[styles.th, { flex: 1.2 }]}>Admin</Text>
+                  <Text style={[styles.th, { flex: 1.4 }]}>
+                    Start date
+                  </Text>
+                  <Text style={[styles.th, { flex: 0.8 }]}>ID</Text>
+                </View>
+
+                {items.map((u) => (
+                  <Pressable
+                    key={u.id}
+                    onPress={() => selectRow(u)}
+                    style={({ pressed }) => [
+                      styles.tableRow,
+                      pressed && { backgroundColor: COLORS.primary + "30" },
+                    ]}
+                  >
+                    <Text style={[styles.td, { flex: 2 }]}>
+                      {u.real_name}
+                    </Text>
+                    <Text style={[styles.td, { flex: 1.5 }]}>
+                      {u.username}
+                    </Text>
+                    <Text style={[styles.td, { flex: 2.3 }]}>
+                      {u.email}
+                    </Text>
+                    <View
+                      style={{
+                        flex: 1.8,
+                        justifyContent: "center",
+                        alignItems: "flex-start",
+                      }}
+                    >
+                      {u.profile_pic ? (
+                        <S3Image
+                          source={u.profile_pic}
+                          style={{
+                            width: 40,
+                            height: 40,
+                            borderRadius: 8,
+                          }}
+                          resizeMode="cover"
+                          fallback={<Text style={styles.td}>-</Text>}
+                        />
+                      ) : (
+                        <Text style={styles.td}>-</Text>
+                      )}
+                    </View>
+
+                    <Text style={[styles.td, { flex: 1.8 }]}>
+                      {u.phone_number || "-"}
+                    </Text>
+                    <Text style={[styles.td, { flex: 1.2 }]}>
+                      {u.email_visible ? "Yes" : "No"}
+                    </Text>
+                    <Text style={[styles.td, { flex: 1.2 }]}>
+                      {u.is_admin ? "Yes" : "No"}
+                    </Text>
+                    <Text style={[styles.td, { flex: 1.4 }]}>
+                      {formatDate(u.created_at)}
+                    </Text>
+                    <Text style={[styles.td, { flex: 0.8 }]}>{u.id}</Text>
+                  </Pressable>
+                ))}
+
+                {items.length === 0 && !loading && (
+                  <View style={{ paddingVertical: 8 }}>
+                    <Text
+                      style={{
+                        fontSize: 13,
+                        color: COLORS.muted,
+                      }}
+                    >
+                      No users to show.
+                    </Text>
+                  </View>
+                )}
+              </View>
+            </ScrollView>
+
+            {/* Pager */}
+            <View style={styles.pager}>
+              <Pressable
+                style={styles.btn}
+                disabled={page === 1}
+                onPress={() => goPage(page - 1)}
+              >
+                <Text>Previous</Text>
+              </Pressable>
+              <Text style={{ color: "#6b7280", marginHorizontal: 8 }}>
+                Page {page} / {totalPages}
+              </Text>
+              <Pressable
+                style={styles.btn}
+                disabled={page === totalPages}
+                onPress={() => goPage(page + 1)}
+              >
+                <Text>Next</Text>
+              </Pressable>
+              {total > pageSize && (
+                <Pressable
+                  style={styles.btn}
+                  onPress={() => {
+                    setPageSize(9999);
+                    if (tab === "all") loadAll(1);
+                    else loadFind(1);
+                  }}
+                >
+                  <Text>Show all</Text>
+                </Pressable>
+              )}
+            </View>
+          </View>
+        )}
+
+        {/* Add account */}
+        {tab === "add" && (
+          <View style={styles.card}>
+            <Text style={styles.cardTitle}>Add a new account</Text>
+
+            <View style={styles.formRow}>
+              <View style={{ flex: 1, marginRight: 12 }}>
+                <Text style={styles.label}>Real Name</Text>
+                <TextInput
+                  value={addForm.real_name}
+                  onChangeText={(v) =>
+                    setAddForm({ ...addForm, real_name: v })
+                  }
+                  style={styles.input}
+                />
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.label}>Username</Text>
+                <TextInput
+                  value={addForm.username}
+                  onChangeText={(v) =>
+                    setAddForm({ ...addForm, username: v })
+                  }
+                  style={styles.input}
+                />
+              </View>
+            </View>
+
+            <View style={styles.formRow}>
+              <View style={{ flex: 1, marginRight: 12 }}>
+                <Text style={styles.label}>Email</Text>
+                <TextInput
+                  value={addForm.email}
+                  onChangeText={(v) =>
+                    setAddForm({ ...addForm, email: v })
+                  }
+                  style={styles.input}
+                />
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.label}>Phone Number</Text>
+                <TextInput
+                  value={addForm.phone_number}
+                  onChangeText={(v) =>
+                    setAddForm({ ...addForm, phone_number: v })
+                  }
+                  style={styles.input}
+                />
+              </View>
+            </View>
+
+            <View style={styles.formRow}>
+              <View style={{ flex: 1, marginRight: 12 }}>
+                <Text style={styles.label}>Password</Text>
+                <TextInput
+                  value={addForm.password}
+                  onChangeText={(v) =>
+                    setAddForm({ ...addForm, password: v })
+                  }
+                  style={styles.input}
+                  secureTextEntry
+                />
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.label}>Confirm Password</Text>
+                <TextInput
+                  value={addForm.password2}
+                  onChangeText={(v) =>
+                    setAddForm({ ...addForm, password2: v })
+                  }
+                  style={styles.input}
+                  secureTextEntry
+                />
+              </View>
+            </View>
+
+            <View style={styles.toggleRow}>
+              <View style={{ flexDirection: "row", alignItems: "center" }}>
+                <Text style={styles.label}>email_visible</Text>
+                <Switch
+                  value={addForm.email_visible}
+                  onValueChange={(v) =>
+                    setAddForm({ ...addForm, email_visible: v })
+                  }
+                />
+              </View>
+              <View style={{ flexDirection: "row", alignItems: "center" }}>
+                <Text style={styles.label}>is_admin</Text>
+                <Switch
+                  value={addForm.is_admin}
+                  onValueChange={(v) =>
+                    setAddForm({ ...addForm, is_admin: v })
+                  }
+                />
+              </View>
+
+              <View style={{ flex: 1 }} />
+
+              <View style={styles.actionRow}>
+                <Pressable
+                  style={[styles.btn, styles.btnPrimary]}
+                  onPress={createUser}
+                >
+                  <Text style={{ color: COLORS.white }}>Create</Text>
+                </Pressable>
+                <Pressable
+                  style={styles.btn}
+                  onPress={() => {
+                    setAddForm({
+                      real_name: "",
+                      username: "",
+                      email: "",
+                      phone_number: "",
+                      password: "",
+                      password2: "",
+                      email_visible: false,
+                      is_admin: false,
+                    });
+                    setAddError("");
+                  }}
+                >
+                  <Text>Clear</Text>
+                </Pressable>
+              </View>
+            </View>
+
+            {addError ? (
+              <Text style={{ color: "#dc2626", marginTop: 8 }}>
+                {addError}
+              </Text>
+            ) : null}
+          </View>
+        )}
+
+        {/* Edit account */}
+        {tab === "edit" && (
+          <View style={styles.card}>
+            <Text style={styles.cardTitle}>Edit account</Text>
+            {!editForm.id && (
+              <Text style={{ color: "#6b7280", marginBottom: 8 }}>
+                Select a row in the table (Find/All) or enter an ID below.
+              </Text>
+            )}
+
+            {/* ID + load */}
+            <View style={styles.formRow}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.label}>User ID</Text>
+                <View style={styles.idRow}>
+                  <TextInput
+                    value={editIdInput}
+                    onChangeText={setEditIdInput}
+                    placeholder="ID to load…"
+                    keyboardType="numeric"
+                    style={[styles.input, { flex: 1 }]}
+                    onSubmitEditing={loadForEdit}
+                  />
+                  <Pressable
+                    style={[
+                      styles.btn,
+                      styles.btnPrimary,
+                      { marginLeft: 8 },
+                    ]}
+                    onPress={loadForEdit}
+                  >
+                    <Text style={{ color: COLORS.white }}>Load</Text>
+                  </Pressable>
+                </View>
+              </View>
+              <View style={{ flex: 1 }} />
+            </View>
+
+            {/* Names */}
+            <View style={styles.formRow}>
+              <View style={{ flex: 1, marginRight: 12 }}>
+                <Text style={styles.label}>Real Name</Text>
+                <TextInput
+                  value={editForm.real_name}
+                  onChangeText={(v) =>
+                    setEditForm({ ...editForm, real_name: v })
+                  }
+                  style={styles.input}
+                />
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.label}>Username</Text>
+                <TextInput
+                  value={editForm.username}
+                  onChangeText={(v) =>
+                    setEditForm({ ...editForm, username: v })
+                  }
+                  style={styles.input}
+                />
+              </View>
+            </View>
+
+            {/* Email / phone */}
+            <View style={styles.formRow}>
+              <View style={{ flex: 1, marginRight: 12 }}>
+                <Text style={styles.label}>Email</Text>
+                <TextInput
+                  value={editForm.email}
+                  onChangeText={(v) =>
+                    setEditForm({ ...editForm, email: v })
+                  }
+                  style={styles.input}
+                />
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.label}>Phone Number</Text>
+                <TextInput
+                  value={editForm.phone_number}
+                  onChangeText={(v) =>
+                    setEditForm({
+                      ...editForm,
+                      phone_number: v,
+                    })
+                  }
+                  style={styles.input}
+                />
+              </View>
+            </View>
+
+            {/* Toggles */}
+            <View style={styles.toggleRow}>
+              <View style={{ flexDirection: "row", alignItems: "center" }}>
+                <Text style={styles.label}>email_visible</Text>
+                <Switch
+                  value={editForm.email_visible}
+                  onValueChange={(v) =>
+                    setEditForm({ ...editForm, email_visible: v })
+                  }
+                />
+              </View>
+              <View style={{ flexDirection: "row", alignItems: "center" }}>
+                <Text style={styles.label}>is_admin</Text>
+                <Switch
+                  value={editForm.is_admin}
+                  onValueChange={(v) =>
+                    setEditForm({ ...editForm, is_admin: v })
+                  }
+                />
+              </View>
+
+              <View style={{ flex: 1 }} />
+
+              <View style={styles.actionRow}>
+                <Pressable
+                  style={[styles.btn, styles.btnPrimary]}
+                  disabled={!editForm.id}
+                  onPress={saveEdit}
+                >
+                  <Text style={{ color: "#ffffff" }}>
+                    Save changes
+                  </Text>
+                </Pressable>
+                <Pressable
+                  style={styles.btn}
+                  disabled={!editForm.id}
+                  onPress={deleteUser}
+                >
+                  <Text>Delete</Text>
+                </Pressable>
+              </View>
+            </View>
+
+            {editError ? (
+              <Text style={{ color: "#dc2626", marginTop: 8 }}>
+                {editError}
+              </Text>
+            ) : null}
+          </View>
+        )}
+      </ScrollView>
+    </AdminShell>
+  );
+}
+
+// --------------- Tab button ----------------
+type TabButtonProps = {
+  label: string;
+  active?: boolean;
+  onPress: () => void;
+};
+
+const TabButton: React.FC<TabButtonProps> = ({ label, active, onPress }) => {
+  return (
+    <Pressable
+      onPress={onPress}
+      style={({ pressed }) => [
+        styles.tabButton,
+        active && styles.tabButtonActive,
+        pressed && { opacity: 0.9 },
+      ]}
+    >
+      <Text
+        style={[
+          styles.tabButtonText,
+          active && styles.tabButtonTextActive,
+        ]}
+      >
+        {label}
+      </Text>
+    </Pressable>
+  );
+};
+
+// --------------- Styles ----------------
+const styles = StyleSheet.create({
+  tabRow: {
+    flexDirection: "row",
+    marginBottom: 12,
+  },
+  tabButton: {
+    flex: 1,
+    marginRight: 12,
+    backgroundColor: COLORS.white,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    paddingVertical: 14,
+    alignItems: "center",
+  },
+  tabButtonActive: {
+    borderColor: COLORS.surface,
+    shadowColor: COLORS.surface,
+    shadowOpacity: 0.15,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 0 },
+  },
+  tabButtonText: {
+    fontSize: 14,
+    fontWeight: "600",
+    color: COLORS.text,
+  },
+  tabButtonTextActive: {
+    color: COLORS.text,
+  },
+  card: {
+    backgroundColor: COLORS.white,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    padding: 16,
+    marginTop: 12,
+  },
+  cardTitle: {
+    fontSize: 16,
+    fontWeight: "600",
+    marginBottom: 8,
+    color: COLORS.text,
+  },
+  label: {
+    fontSize: 12,
+    color: COLORS.muted,
+    marginBottom: 4,
+    marginRight: 8,
+  },
+  filterRow: {
+    flexDirection: "row",
+    marginTop: 8,
+  },
+  input: {
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    borderRadius: 10,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    backgroundColor: COLORS.white,
+    color: COLORS.text,
+    placeholderTextColor: COLORS.muted,
+  },
+  inputLg: {
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    backgroundColor: COLORS.white,
+    color: COLORS.text,
+    placeholderTextColor: COLORS.muted,
+  },
+  selectFake: {
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    borderRadius: 10,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    backgroundColor: COLORS.white,
+  },
+  chip: {
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.white,
+  },
+  actionRow: {
+    flexDirection: "row",
+    justifyContent: "flex-end",
+    marginTop: 12,
+  },
+  btn: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.white,
+    marginLeft: 10,
+  },
+  btnPrimary: {
+    backgroundColor: COLORS.surface,
+    borderColor: COLORS.surface,
+  },
+  tableHeader: {
+    flexDirection: "row",
+    borderBottomWidth: 1,
+    borderBottomColor: COLORS.border,
+    paddingVertical: 6,
+    marginTop: 8,
+  },
+  tableRow: {
+    flexDirection: "row",
+    borderBottomWidth: 1,
+    borderBottomColor: COLORS.border,
+    paddingVertical: 6,
+  },
+  th: {
+    fontSize: 12,
+    fontWeight: "600",
+    color: COLORS.muted,
+  },
+  td: {
+    fontSize: 13,
+    color: COLORS.text,
+  },
+  pager: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginTop: 12,
+  },
+  formRow: {
+    flexDirection: "row",
+    marginTop: 12,
+  },
+  idRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginTop: 4,
+  },
+  toggleRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginTop: 12,
+  },
+});
